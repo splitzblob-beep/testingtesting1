@@ -23,6 +23,12 @@
 			"description": "Lets the prediction use orbs, pads and gravity portals. Turn off if you notice glitches around them.",
 			"default": true
 		},
+		"wave-buffer": {
+			"type": "bool",
+			"name": "Buffer in wave",
+			"description": "Turn off to leave all wave inputs exactly as you click them.",
+			"default": true
+		},
 		"budget-ms": {
 			"type": "float",
 			"name": "Prediction time limit (ms)",
