@@ -146,7 +146,10 @@ namespace pib {
         bool appliedDown = false;   // what the game has been told
         bool isPlayer1 = true;
         std::deque<Pending> queue;
-        int shift = 0;              // delay given to every input while the queue is busy
+        int shift = 0;              // delay given to the input paired with a held-back one
+        bool pairPending = false;   // the next input still needs the same delay (tap/hold length)
+        int lastInputTick = -1000;
+        int rapid = 0;              // inputs in a row that came quickly (spam / straight flying)
         float tickDt = FALLBACK_TICK_DT;
 
         // how long you usually hold a tap (median of the last few)
@@ -315,6 +318,14 @@ namespace pib {
         ghost->m_collisionLogLeft->removeAllObjects();
         ghost->m_collisionLogRight->removeAllObjects();
         layer->checkCollisions(ghost, dt, false);
+
+        // Hitting a hazard sets the level's "player died" flag even though the death
+        // itself is blocked. Count it as a ghost death and clear it right away, or the
+        // game shows its death hitbox view for a frame as if you had died.
+        if (layer->m_playerDied) {
+            g.ghostDied = true;
+            layer->m_playerDied = false;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -344,11 +355,16 @@ namespace pib {
             copyState(g.ghost2, p2);
         }
 
+        // Level flags the ghost can trip; they're put back exactly as they were afterwards.
+        bool savedPlayerDied = layer->m_playerDied;
+        bool savedDebugDraw = layer->m_isDebugDrawEnabled;
+        layer->m_playerDied = false;
+
         g.simulating = true;
         g.ghostDied = false;
         g.ghostHitStop = false;
 
-        float dt = (g.tickDt > 0.001f && g.tickDt < 2.f) ? g.tickDt : FALLBACK_TICK_DT;
+        float dt =(g.tickDt > 0.001f && g.tickDt < 2.f) ? g.tickDt : FALLBACK_TICK_DT;
         bool flying = isFlying(p1) || (both && isFlying(p2));
         int airTicks = 0;
         int groundTicks = 0;
@@ -411,6 +427,8 @@ namespace pib {
         }
 
         restoreSandbox();
+        layer->m_playerDied = savedPlayerDied;
+        layer->m_isDebugDrawEnabled = savedDebugDraw;
         g.simulating = false;
         g.ghostDied = false;
         g.ghostHitStop = false;
@@ -418,37 +436,37 @@ namespace pib {
     }
 
     // Returns how many ticks to hold the input back, or 0 to send it right away.
-    int findDelay(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool down, int horizon, int maxDelay,
-        int releaseAfter) {
+    //
+    // killWindow: only a death this soon after the click counts as caused by its timing.
+    // Anything later is probably something your next input would have handled, so the
+    // mod leaves the click alone instead of delaying a click that was actually fine.
+    int findDelay(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool down, int horizon, int killWindow,
+        int maxDelay, int releaseAfter) {
         using clock = std::chrono::steady_clock;
         auto start = clock::now();
 
         auto now = simulate(layer, p1, p2, 0, down, horizon, releaseAfter);
-        if (now.safe || now.doomed) {
+        if (now.safe || now.doomed || now.survived >= killWindow) {
             return 0;
         }
 
-        int best = 0;
-        int bestSurvived = now.survived;
+        // A delayed click has to clearly get past the danger, not just die a bit later.
+        int target = std::min(horizon, killWindow + 12);
+
+        // The smallest delay that works wins, so clicks are moved as little as possible.
         for (int k = 1; k <= maxDelay; ++k) {
             auto later = simulate(layer, p1, p2, k, down, horizon, releaseAfter);
             if (later.doomed) {
                 break;
             }
-            if (later.safe) {
+            if (later.safe || later.survived >= target) {
                 return k;
-            }
-            if (later.survived > bestSurvived) {
-                best = k;
-                bestSurvived = later.survived;
             }
             if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > g.budgetMs) {
                 break;
             }
         }
-
-        // Nothing fully safe: only use a delay if it's clearly better than clicking now.
-        return bestSurvived >= now.survived + 20 ? best : 0;
+        return 0;
     }
 
     // ------------------------------------------------------------------
@@ -466,6 +484,7 @@ namespace pib {
     void flush(PlayLayer* layer) {
         g.queue.clear();
         g.shift = 0;
+        g.pairPending = false;
         if (layer && g.appliedDown != g.physicalDown) {
             send(layer, g.physicalDown);
         }
@@ -474,6 +493,9 @@ namespace pib {
     void resetInput() {
         g.queue.clear();
         g.shift = 0;
+        g.pairPending = false;
+        g.lastInputTick = -1000;
+        g.rapid = 0;
         g.physicalDown = false;
         g.appliedDown = false;
         g.pressedAt = -1;
@@ -505,6 +527,7 @@ namespace pib {
         }
         if (g.queue.empty()) {
             g.shift = 0;
+            g.pairPending = false;
         }
     }
 
@@ -520,22 +543,51 @@ namespace pib {
 
         bool skip = strength.maxTicks <= 0 || !p1 || p1->m_isDead || p1->m_isPlatformer || p1->m_isShip ||
             (p2 && p2->m_isShip);
+        int sinceLast = g.tick - g.lastInputTick;
+        g.lastInputTick = g.tick;
+        g.rapid = sinceLast < 12 ? g.rapid + 1 : 0;
+
         if (skip) {
             g.queue.clear();
             g.shift = 0;
+            g.pairPending = false;
             g.appliedDown = down;
             return false;
         }
 
-        // A click is already being held back: delay this one by the same amount,
-        // so the gap between your inputs (tap length, double taps) stays the same.
+        // A click is already being held back.
         if (!g.queue.empty()) {
-            g.queue.push_back({ std::max(g.shift, g.queue.back().ticksLeft), down });
+            int ticks;
+            if (g.pairPending) {
+                // The release (or press) that goes with the held-back input gets the same
+                // delay, so your tap or hold is exactly as long as you made it.
+                ticks = std::max(g.shift, g.queue.back().ticksLeft);
+                g.pairPending = false;
+            }
+            else {
+                // Anything after that only waits long enough to stay in order, so the
+                // delay never snowballs while you keep clicking.
+                ticks = g.queue.back().ticksLeft + 1;
+            }
+            g.queue.push_back({ ticks, down });
             return true;
+        }
+
+        // Fast taps are clearly on purpose: never second-guess spam.
+        if (sinceLast < 4) {
+            g.appliedDown = down;
+            return false;
         }
 
         bool wave = p1->m_isDart || (p2 && p2->m_isDart);
         bool robot = p1->m_isRobot || (p2 && p2->m_isRobot);
+
+        // Straight flying: once you're spamming in wave, your rhythm is the point.
+        // Predicting single taps would only break it, so stay out until you stop.
+        if (wave && g.rapid >= 2) {
+            g.appliedDown = down;
+            return false;
+        }
 
         // Letting go only changes anything in wave and robot.
         if (!down && !wave && !robot) {
@@ -545,19 +597,22 @@ namespace pib {
 
         bool mini = p1->m_vehicleSize < 1.f;
         int horizon = wave ? (mini ? 24 : 32) : 48;
+        // In wave your next input comes quickly, so only very soon deaths are this click's fault.
+        int killWindow = wave ? (mini ? 12 : 16) : horizon;
         int maxDelay = wave ? strength.maxWaveTicks : strength.maxTicks;
 
         // Cube, ball, ufo, spider and swing re-trigger while held, so model a tap
         // the length you usually tap. Wave and robot hold until their own release.
         int releaseAfter = (down && !wave && !robot) ? holdEstimate() : -1;
 
-        int delay = findDelay(layer, p1, p2, down, horizon, maxDelay, releaseAfter);
+        int delay = findDelay(layer, p1, p2, down, horizon, killWindow, maxDelay, releaseAfter);
         if (delay <= 0) {
             g.appliedDown = down;
             return false;
         }
 
         g.shift = delay;
+        g.pairPending = true;
         g.queue.push_back({ delay, down });
         updateLabel(fmt::format("saved {} +{}t", down ? "click" : "release", delay));
         log::debug("Held {} back by {} ticks", down ? "press" : "release", delay);
