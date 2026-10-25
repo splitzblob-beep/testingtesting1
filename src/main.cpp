@@ -46,10 +46,12 @@ namespace pib {
 
     constexpr std::array<Strength, 5> STRENGTHS { {
         { "OFF", 0, 0 },
-        { "1f", 4, 4 },
-        { "2f", 8, 6 },
-        { "4f", 16, 8 },
-        { "8f", 32, 12 },
+        // Wave stays small at every strength: a few ticks shifts a wave noticeably, and a
+        // bigger shift starts steering you into a different gap instead of fixing timing.
+        { "1f", 4, 2 },
+        { "2f", 8, 3 },
+        { "4f", 16, 4 },
+        { "8f", 32, 6 },
     } };
 
     // dt that PlayerObject::update receives for one 240 Hz physics tick.
@@ -158,6 +160,32 @@ namespace pib {
         std::array<int, 8> holds {};
         int holdCount = 0;
         int holdNext = 0;
+
+        // Your wave rhythm: how long you usually hold up, and how long you usually let go.
+        struct Rolling {
+            std::array<int, 8> values {};
+            int count = 0;
+            int next = 0;
+
+            void add(int v) {
+                values[next] = v;
+                next = (next + 1) % static_cast<int>(values.size());
+                count = std::min(count + 1, static_cast<int>(values.size()));
+            }
+
+            int median(int fallback) const {
+                if (count == 0) {
+                    return fallback;
+                }
+                auto copy = values;
+                auto mid = copy.begin() + count / 2;
+                std::nth_element(copy.begin(), mid, copy.begin() + count);
+                return *mid;
+            }
+        };
+        Rolling waveHolds;
+        Rolling waveGaps;
+        bool waveBuffer = true;
     };
 
     State g;
@@ -169,6 +197,7 @@ namespace pib {
     void readSettings() {
         auto* mod = Mod::get();
         g.orbPrediction = mod->getSettingValue<bool>("orb-prediction");
+        g.waveBuffer = mod->getSettingValue<bool>("wave-buffer");
         g.showLabel = mod->getSettingValue<bool>("show-label");
         g.budgetMs = mod->getSettingValue<double>("budget-ms");
     }
@@ -340,7 +369,8 @@ namespace pib {
     };
 
     // Simulates pressing (or releasing) `delay` ticks from now.
-    // releaseAfter: ticks after the press when the ghost lets go (-1 = keep holding).
+    // releaseAfter: ticks after the input when the ghost switches back (lets go after a
+    // press, presses again after a release). -1 = never switch back.
     SimResult simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, int delay, bool down, int horizon,
         int releaseAfter) {
         SimResult res;
@@ -379,9 +409,9 @@ namespace pib {
                 }
             }
             if (releaseAfter >= 0 && t == delay + releaseAfter) {
-                pressGhost(g.ghost1, false);
+                pressGhost(g.ghost1, !down);
                 if (both) {
-                    pressGhost(g.ghost2, false);
+                    pressGhost(g.ghost2, !down);
                 }
             }
 
@@ -555,6 +585,25 @@ namespace pib {
             return false;
         }
 
+        bool wave = p1->m_isDart || (p2 && p2->m_isDart);
+        bool robot = p1->m_isRobot || (p2 && p2->m_isRobot);
+
+        // Learn your wave rhythm from real inputs: a press ends a "let go" stretch and a
+        // release ends a "hold up" stretch. Spam is left out so it doesn't skew it.
+        if (wave && sinceLast >= 4 && sinceLast < 120) {
+            if (down) {
+                g.waveGaps.add(sinceLast);
+            }
+            else {
+                g.waveHolds.add(sinceLast);
+            }
+        }
+
+        if (wave && !g.waveBuffer) {
+            g.appliedDown = down;
+            return false;
+        }
+
         // A click is already being held back.
         if (!g.queue.empty()) {
             int ticks;
@@ -579,9 +628,6 @@ namespace pib {
             return false;
         }
 
-        bool wave = p1->m_isDart || (p2 && p2->m_isDart);
-        bool robot = p1->m_isRobot || (p2 && p2->m_isRobot);
-
         // Straight flying: once you're spamming in wave, your rhythm is the point.
         // Predicting single taps would only break it, so stay out until you stop.
         if (wave && g.rapid >= 2) {
@@ -597,13 +643,26 @@ namespace pib {
 
         bool mini = p1->m_vehicleSize < 1.f;
         int horizon = wave ? (mini ? 24 : 32) : 48;
-        // In wave your next input comes quickly, so only very soon deaths are this click's fault.
-        int killWindow = wave ? (mini ? 12 : 16) : horizon;
+        // In wave your next input comes quickly, so only a death right after the click
+        // counts as this click's fault.
+        int killWindow = wave ? (mini ? 8 : 10) : horizon;
         int maxDelay = wave ? strength.maxWaveTicks : strength.maxTicks;
 
-        // Cube, ball, ufo, spider and swing re-trigger while held, so model a tap
-        // the length you usually tap. Wave and robot hold until their own release.
-        int releaseAfter = (down && !wave && !robot) ? holdEstimate() : -1;
+        int releaseAfter = -1;
+        if (wave) {
+            // The ghost follows your usual rhythm instead of holding one direction forever.
+            // Holding forever made the path you were really taking look deadly (it flew into
+            // the next wall), so the mod "saved" you into whatever gap stayed open longest.
+            // With your rhythm, a delayed click only shifts the same zigzag a few ticks,
+            // so it can only fix timing on the path you chose.
+            int typical = down ? g.waveHolds.median(10) : g.waveGaps.median(10);
+            releaseAfter = std::clamp(typical, 2, horizon);
+        }
+        else if (down && !robot) {
+            // Cube, ball, ufo, spider and swing re-trigger while held, so model a tap
+            // the length you usually tap. Robot holds until its own release.
+            releaseAfter = holdEstimate();
+        }
 
         int delay = findDelay(layer, p1, p2, down, horizon, killWindow, maxDelay, releaseAfter);
         if (delay <= 0) {
