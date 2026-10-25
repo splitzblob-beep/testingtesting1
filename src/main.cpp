@@ -12,6 +12,7 @@
 // Runs made with this mod are not legit for lists or leaderboards.
 
 #include <Geode/Geode.hpp>
+#include <Geode/modify/CCDrawNode.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -789,6 +790,14 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::gameEventTriggered(event, material, playerID);
     }
 
+    // The game's own hitbox view: never redraw it in the middle of a prediction.
+    void updateDebugDraw() {
+        if (pib::g.simulating) {
+            return;
+        }
+        GJBaseGameLayer::updateDebugDraw();
+    }
+
     // Safety net if a mode portal slips through: end the prediction, change nothing.
     void playerWillSwitchMode(PlayerObject* player, GameObject* object) {
         if (pib::g.simulating) {
@@ -871,6 +880,63 @@ class $modify(PIBHardStreak, HardStreak) {
             return;
         }
         HardStreak::addPoint(point);
+    }
+};
+
+// Nothing should be drawn while the ghost is being simulated. Without this, hitbox
+// displays (the game's own or another mod's) briefly flash whatever the ghost touched.
+class $modify(PIBDrawNode, CCDrawNode) {
+    bool drawPolygon(CCPoint* verts, unsigned int count, ccColor4F const& fill, float borderWidth,
+        ccColor4F const& borderColor, BorderAlignment alignment) {
+        if (pib::g.simulating) {
+            return false;
+        }
+        return CCDrawNode::drawPolygon(verts, count, fill, borderWidth, borderColor, alignment);
+    }
+
+    bool drawRect(CCRect const& rect, ccColor4F const& fill, float borderWidth, ccColor4F const& borderColor,
+        BorderAlignment alignment) {
+        if (pib::g.simulating) {
+            return false;
+        }
+        return CCDrawNode::drawRect(rect, fill, borderWidth, borderColor, alignment);
+    }
+
+    bool drawRect(CCPoint const& origin, CCPoint const& destination, ccColor4F const& fill, float borderWidth,
+        ccColor4F const& borderColor, BorderAlignment alignment) {
+        if (pib::g.simulating) {
+            return false;
+        }
+        return CCDrawNode::drawRect(origin, destination, fill, borderWidth, borderColor, alignment);
+    }
+
+    bool drawSegment(CCPoint const& from, CCPoint const& to, float radius, ccColor4F const& color) {
+        if (pib::g.simulating) {
+            return false;
+        }
+        return CCDrawNode::drawSegment(from, to, radius, color);
+    }
+
+    bool drawLines(CCPoint* verts, unsigned int count, float width, ccColor4F const& color) {
+        if (pib::g.simulating) {
+            return false;
+        }
+        return CCDrawNode::drawLines(verts, count, width, color);
+    }
+
+    bool drawCircle(CCPoint const& position, float radius, ccColor4F const& color, float borderWidth,
+        ccColor4F const& borderColor, unsigned int segments) {
+        if (pib::g.simulating) {
+            return false;
+        }
+        return CCDrawNode::drawCircle(position, radius, color, borderWidth, borderColor, segments);
+    }
+
+    bool drawDot(CCPoint const& position, float radius, ccColor4F const& color) {
+        if (pib::g.simulating) {
+            return false;
+        }
+        return CCDrawNode::drawDot(position, radius, color);
     }
 };
 
