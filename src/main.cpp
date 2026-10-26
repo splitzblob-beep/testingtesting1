@@ -6,7 +6,12 @@
 //
 // 1 tick = 1/240 s = a quarter of a frame at 60 fps.
 //
+// It also learns where you die in each level: it helps more at your problem spots,
+// less where you're consistent, and (optionally) forgives near-miss deaths at spots
+// where your clicks are usually late.
+//
 // Controls: F6 in a level cycles the strength (OFF -> 1f -> 2f -> 4f -> 8f).
+//           F7 in a level resets what was learned for that level.
 //
 // Not buffered: ship mode, platformer levels, 2-player levels.
 // Runs made with this mod are not legit for lists or leaderboards.
@@ -24,9 +29,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <climits>
+#include <cmath>
 #include <cstdint>
 #include <deque>
+#include <fstream>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -186,9 +196,180 @@ namespace pib {
         Rolling waveHolds;
         Rolling waveGaps;
         bool waveBuffer = true;
+
+        // learning settings
+        bool learn = true;
+        bool forgiving = false;
+        bool shipAssist = false;
+
+        // What was learned about the current level, per 1-block-wide spot.
+        struct Spot {
+            float heat = 0.f;  // how often you die around here
+            float late = 0.f;  // how often those deaths followed a click no delay could save
+        };
+        using LevelMap = std::unordered_map<int, Spot>;
+        std::unordered_map<std::string, LevelMap> learned;
+        LevelMap* current = nullptr;
+        int lastBin = INT_MIN;
+        int lastUnsaveableTick = -1000;
+        int deathsSinceSave = 0;
     };
 
     State g;
+
+    // ------------------------------------------------------------------
+    // Learning from deaths
+    // ------------------------------------------------------------------
+
+    constexpr float BLOCK = 30.f;             // one block in game units
+    constexpr float HEAT_CAP = 10.f;
+    constexpr float FULL_HELP_HEAT = 2.5f;    // this much heat = maximum extra help
+    constexpr float PASS_DECAY = 0.92f;       // each clean pass through a spot cools it down
+    constexpr float MAX_FORGIVE_UNITS = 4.f;  // most a hitbox can be eased (~1/8 of a block)
+
+    int binOf(float x) {
+        return static_cast<int>(std::floor(x / BLOCK));
+    }
+
+    float struggle(float heat) {
+        return std::clamp(heat / FULL_HELP_HEAT, 0.f, 1.f);
+    }
+
+    State::Spot spotAt(float x) {
+        if (!g.current) {
+            return {};
+        }
+        auto it = g.current->find(binOf(x));
+        return it == g.current->end() ? State::Spot {} : it->second;
+    }
+
+    // The danger a click reacts to is just ahead, so look a couple of blocks forward.
+    State::Spot spotAhead(float x) {
+        State::Spot out;
+        if (!g.current) {
+            return out;
+        }
+        int bin = binOf(x);
+        for (int i = 0; i <= 2; ++i) {
+            auto it = g.current->find(bin + i);
+            if (it != g.current->end()) {
+                out.heat = std::max(out.heat, it->second.heat);
+                out.late = std::max(out.late, it->second.late);
+            }
+        }
+        return out;
+    }
+
+    std::string levelKey(GJGameLevel* level) {
+        if (!level) {
+            return "none";
+        }
+        int id = level->m_levelID.value();
+        if (id > 0) {
+            return fmt::format("id{}", id);
+        }
+        // Levels that aren't online (your own, unpublished) are told apart by name.
+        std::string key = "local_" + std::string(level->m_levelName);
+        for (auto& c : key) {
+            if (c == '\t' || c == '\n' || c == '\r') {
+                c = '_';
+            }
+        }
+        return key;
+    }
+
+    std::filesystem::path learnedFile() {
+        return Mod::get()->getSaveDir() / "learned.txt";
+    }
+
+    // One line per level: key<TAB>bin:heat:late,bin:heat:late,...
+    void loadLearned() {
+        g.learned.clear();
+        std::ifstream file(learnedFile());
+        std::string line;
+        while (std::getline(file, line)) {
+            auto tab = line.find('\t');
+            if (tab == std::string::npos) {
+                continue;
+            }
+            auto& level = g.learned[line.substr(0, tab)];
+            std::istringstream entries(line.substr(tab + 1));
+            std::string entry;
+            while (std::getline(entries, entry, ',')) {
+                int bin = 0;
+                float heat = 0.f;
+                float late = 0.f;
+                if (std::sscanf(entry.c_str(), "%d:%f:%f", &bin, &heat, &late) == 3) {
+                    level[bin] = { std::clamp(heat, 0.f, HEAT_CAP), std::clamp(late, 0.f, HEAT_CAP) };
+                }
+            }
+        }
+    }
+
+    void saveLearned() {
+        g.deathsSinceSave = 0;
+        std::ofstream file(learnedFile(), std::ios::trunc);
+        if (!file) {
+            log::warn("Couldn't save learned data");
+            return;
+        }
+        for (auto const& [key, level] : g.learned) {
+            std::string line;
+            for (auto const& [bin, spot] : level) {
+                if (spot.heat < 0.05f && spot.late < 0.05f) {
+                    continue;
+                }
+                line += fmt::format("{}{}:{:.2f}:{:.2f}", line.empty() ? "" : ",", bin, spot.heat, spot.late);
+            }
+            if (!line.empty()) {
+                file << key << '\t' << line << '\n';
+            }
+        }
+    }
+
+    bool countsForLearning(PlayerObject* player) {
+        return player && !player->m_isPlatformer && (!player->m_isShip || g.shipAssist);
+    }
+
+    void recordDeath(PlayerObject* player) {
+        if (!g.current || !countsForLearning(player)) {
+            return;
+        }
+        // The click that caused a death usually happened a little before it, so the
+        // spots just behind the death get some of the blame too.
+        constexpr float spread[] = { 1.f, 0.8f, 0.6f, 0.4f, 0.2f };
+        bool late = g.tick - g.lastUnsaveableTick < 90;
+        int bin = binOf(player->getPositionX());
+        for (int i = 0; i < 5; ++i) {
+            auto& spot = (*g.current)[bin - i];
+            spot.heat = std::min(spot.heat + spread[i], HEAT_CAP);
+            if (late) {
+                spot.late = std::min(spot.late + spread[i], HEAT_CAP);
+            }
+        }
+        if (++g.deathsSinceSave >= 5) {
+            saveLearned();
+        }
+    }
+
+    // Called every tick for player 1: getting through a spot alive cools it down.
+    void trackProgress(PlayerObject* player) {
+        if (!g.current || !player || player->m_isDead) {
+            return;
+        }
+        int bin = binOf(player->getPositionX());
+        if (bin == g.lastBin) {
+            return;
+        }
+        if (bin > g.lastBin && g.lastBin != INT_MIN) {
+            auto it = g.current->find(bin);
+            if (it != g.current->end()) {
+                it->second.heat *= PASS_DECAY;
+                it->second.late *= PASS_DECAY;
+            }
+        }
+        g.lastBin = bin;
+    }
 
     // ------------------------------------------------------------------
     // Small helpers
@@ -200,6 +381,9 @@ namespace pib {
         g.waveBuffer = mod->getSettingValue<bool>("wave-buffer");
         g.showLabel = mod->getSettingValue<bool>("show-label");
         g.budgetMs = mod->getSettingValue<double>("budget-ms");
+        g.learn = mod->getSettingValue<bool>("learn");
+        g.forgiving = mod->getSettingValue<bool>("forgiving-hitboxes");
+        g.shipAssist = mod->getSettingValue<bool>("ship-assist");
     }
 
     void updateLabel(std::string const& extra = "") {
@@ -470,15 +654,19 @@ namespace pib {
     // killWindow: only a death this soon after the click counts as caused by its timing.
     // Anything later is probably something your next input would have handled, so the
     // mod leaves the click alone instead of delaying a click that was actually fine.
+    // unsaveable: set when the click was about to kill you and no delay could fix it,
+    // which usually means it came too late. Deaths after these count as "late" deaths.
     int findDelay(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool down, int horizon, int killWindow,
-        int maxDelay, int releaseAfter) {
+        int maxDelay, int releaseAfter, bool* unsaveable) {
         using clock = std::chrono::steady_clock;
         auto start = clock::now();
+        *unsaveable = false;
 
         auto now = simulate(layer, p1, p2, 0, down, horizon, releaseAfter);
         if (now.safe || now.doomed || now.survived >= killWindow) {
             return 0;
         }
+        *unsaveable = true;
 
         // A delayed click has to clearly get past the danger, not just die a bit later.
         int target = std::min(horizon, killWindow + 12);
@@ -490,6 +678,7 @@ namespace pib {
                 break;
             }
             if (later.safe || later.survived >= target) {
+                *unsaveable = false;
                 return k;
             }
             if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > g.budgetMs) {
@@ -648,6 +837,15 @@ namespace pib {
         int killWindow = wave ? (mini ? 8 : 10) : horizon;
         int maxDelay = wave ? strength.maxWaveTicks : strength.maxTicks;
 
+        // Learning: little help where you're consistent, more where you keep dying.
+        if (g.learn && g.current) {
+            float s = struggle(spotAhead(p1->getPositionX()).heat);
+            int base = maxDelay;
+            int lo = wave ? std::max(1, base / 2) : std::max(1, base / 4);
+            int hi = wave ? std::min(8, base + 2) : std::min(48, base * 3 / 2);
+            maxDelay = lo + static_cast<int>(std::lround((hi - lo) * s));
+        }
+
         int releaseAfter = -1;
         if (wave) {
             // The ghost follows your usual rhythm instead of holding one direction forever.
@@ -664,7 +862,11 @@ namespace pib {
             releaseAfter = holdEstimate();
         }
 
-        int delay = findDelay(layer, p1, p2, down, horizon, killWindow, maxDelay, releaseAfter);
+        bool unsaveable = false;
+        int delay = findDelay(layer, p1, p2, down, horizon, killWindow, maxDelay, releaseAfter, &unsaveable);
+        if (unsaveable) {
+            g.lastUnsaveableTick = g.tick;
+        }
         if (delay <= 0) {
             g.appliedDown = down;
             return false;
@@ -676,6 +878,49 @@ namespace pib {
         updateLabel(fmt::format("saved {} +{}t", down ? "click" : "release", delay));
         log::debug("Held {} back by {} ticks", down ? "press" : "release", delay);
         return true;
+    }
+
+    // Near-miss forgiveness: at spots where your deaths keep coming from late clicks,
+    // a death that only barely touched a hazard or block is ignored. How much is
+    // forgiven grows with how often you've died late there, up to MAX_FORGIVE_UNITS.
+    bool shouldForgive(PlayerObject* player, GameObject* object) {
+        if (!g.forgiving || !g.current || STRENGTHS[g.strength].maxTicks <= 0) {
+            return false;
+        }
+        if (!player || !object || player->m_isDead || player->m_isPlatformer) {
+            return false;
+        }
+        if (player->m_isShip && !g.shipAssist) {
+            return false;
+        }
+        constexpr uint64_t deadly = bit(GameObjectType::Hazard) | bit(GameObjectType::AnimatedHazard) |
+            bit(GameObjectType::Solid);
+        if (!(typeBit(object) & deadly)) {
+            return false;
+        }
+
+        float s = struggle(spotAt(player->getPositionX()).late);
+        if (s < 0.05f) {
+            return false;
+        }
+        float margin = MAX_FORGIVE_UNITS * s;
+
+        CCRect p = player->getObjectRect();
+        CCRect o = object->getObjectRect();
+        float overlapX = std::min(p.getMaxX(), o.getMaxX()) - std::max(p.getMinX(), o.getMinX());
+        float overlapY = std::min(p.getMaxY(), o.getMaxY()) - std::max(p.getMinY(), o.getMinY());
+        float depth = std::max(0.f, std::min(overlapX, overlapY));
+        return depth <= margin;
+    }
+
+    void resetLearnedHere() {
+        if (!g.current) {
+            return;
+        }
+        g.current->clear();
+        saveLearned();
+        updateLabel("learned data reset");
+        log::info("Learned data reset for this level");
     }
 
     void cycleStrength(PlayLayer* layer) {
@@ -695,6 +940,7 @@ $on_mod(Loaded) {
     pib::readSettings();
     auto start = Mod::get()->getSettingValue<int64_t>("start-strength");
     pib::g.strength = static_cast<int>(std::clamp<int64_t>(start, 0, pib::STRENGTHS.size() - 1));
+    pib::loadLearned();
 }
 
 // ----------------------------------------------------------------------
@@ -727,6 +973,10 @@ class $modify(PIBPlayLayer, PlayLayer) {
         pib::g.ghost1 = m_fields->ghost1.data();
         pib::g.ghost2 = m_fields->ghost2.data();
 
+        pib::g.current = &pib::g.learned[pib::levelKey(level)];
+        pib::g.lastBin = INT_MIN;
+        pib::g.lastUnsaveableTick = -1000;
+
         auto* label = CCLabelBMFont::create("", "bigFont.fnt");
         label->setScale(0.3f);
         label->setAnchorPoint({ 0.f, 0.f });
@@ -743,6 +993,8 @@ class $modify(PIBPlayLayer, PlayLayer) {
         pib::g.ghost2 = nullptr;
         pib::g.label = nullptr;
         pib::resetInput();
+        pib::saveLearned();
+        pib::g.current = nullptr;
         m_fields->ghost1 = nullptr;
         m_fields->ghost2 = nullptr;
         m_fields->sandbox = nullptr;
@@ -754,16 +1006,25 @@ class $modify(PIBPlayLayer, PlayLayer) {
             pib::g.ghostDied = true;
             return;
         }
+        if (pib::shouldForgive(player, object)) {
+            // The hazard set the "player died" flag before calling this; clear it so the
+            // game doesn't treat the forgiven touch as a death.
+            m_playerDied = false;
+            return;
+        }
+        bool wasDead = player && player->m_isDead;
         PlayLayer::destroyPlayer(player, object);
-        if (player && player->m_isDead) {
+        if (player && player->m_isDead && !wasDead) {
             pib::g.queue.clear();
             pib::g.shift = 0;
             pib::g.appliedDown = false;
+            pib::recordDeath(player);
         }
     }
 
     void resetLevel() {
         pib::resetInput();
+        pib::g.lastBin = INT_MIN;
         PlayLayer::resetLevel();
     }
 
@@ -942,6 +1203,13 @@ class $modify(PIBPlayerObject, PlayerObject) {
             }
         }
         PlayerObject::update(dt);
+
+        if (!pib::g.simulating) {
+            auto* layer = pib::currentLayer();
+            if (layer && this == layer->m_player1) {
+                pib::trackProgress(this);
+            }
+        }
     }
 
     void ringJump(RingObject* ring, bool skipCheck) {
@@ -1057,9 +1325,14 @@ class $modify(PIBDrawNode, CCDrawNode) {
 // F6 through the game's own keyboard events, so it only works while GD is focused.
 class $modify(PIBKeyboard, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
-        if (isKeyDown && !isKeyRepeat && key == KEY_F6) {
+        if (isKeyDown && !isKeyRepeat) {
             if (auto* layer = pib::currentLayer()) {
-                pib::cycleStrength(layer);
+                if (key == KEY_F6) {
+                    pib::cycleStrength(layer);
+                }
+                else if (key == KEY_F7) {
+                    pib::resetLearnedHere();
+                }
             }
         }
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
