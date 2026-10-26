@@ -29,6 +29,24 @@
 			"description": "Turn off to leave all wave inputs exactly as you click them.",
 			"default": true
 		},
+		"learn": {
+			"type": "bool",
+			"name": "Learn from deaths",
+			"description": "Remembers where you die in each level. Helps more at spots where you keep dying, less where you're consistent. F7 in a level resets what it learned there.",
+			"default": true
+		},
+		"forgiving-hitboxes": {
+			"type": "bool",
+			"name": "Forgiving hitboxes at death spots",
+			"description": "At spots where your deaths come from late clicks, ignores deaths that only barely touch a hazard or block. Works like a tiny bit of noclip there.",
+			"default": false
+		},
+		"ship-assist": {
+			"type": "bool",
+			"name": "Assist in ship mode",
+			"description": "Ship is never buffered. This only lets forgiving hitboxes and learning work in ship. Off = ship plays completely normal.",
+			"default": false
+		},
 		"budget-ms": {
 			"type": "float",
 			"name": "Prediction time limit (ms)",
